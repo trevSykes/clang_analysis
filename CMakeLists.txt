@@ -6,7 +6,7 @@
 
 cmake_minimum_required(VERSION 3.4.3)
 set(CMAKE_OSX_DEPLOYMENT_TARGET "15.2")
-project(MaxArrAssn)
+project(TensorCompAnalysis)
 
 #===============================================================================
 # 1. LOAD LLVM CONFIGURATION
@@ -19,6 +19,7 @@ set(CT_Clang_INSTALL_DIR "/opt/homebrew/Cellar/llvm/19.1.7" CACHE PATH "LLVM ins
 list(APPEND CMAKE_PREFIX_PATH "${CT_Clang_INSTALL_DIR}/lib/cmake/clang/")
 
 find_package(Clang REQUIRED CONFIG)
+find_package(LLVM REQUIRED CONFIG)
 find_package(jsoncpp CONFIG REQUIRED)
 
 
@@ -48,16 +49,14 @@ endif()
 #target_link_libraries(HelloPlugin PRIVATE clangTooling clangBasic clangASTMatchers)
 #
 # Add the source file for the plugin
-add_library(TCA SHARED tensorCompAnalysis.cpp
+add_executable(tca-tool
+    main.cpp
+    tensorCompAnalysis.cpp)
 
-)
-
-# Link the library with Clang and LLVM dependencies
-target_link_libraries(TCA PRIVATE 
-                        PRIVATE
-                        clangTooling
-                        clangBasic
-                        clangAST
-                        clangFrontend
-                        clangParse
-                        jsoncpp_lib)
+target_link_libraries(tca-tool
+    PRIVATE
+    clangTooling
+    clangBasic
+    clangAST
+    clangFrontend
+    jsoncpp_lib)
