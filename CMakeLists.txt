@@ -49,8 +49,12 @@ endif()
 #target_link_libraries(HelloPlugin PRIVATE clangTooling clangBasic clangASTMatchers)
 #
 # Add the source file for the plugin
-add_executable(tca-tool
-    main.cpp
+
+# add_executable(tca-tool
+#     main.cpp
+#     tensorCompAnalysis.cpp)
+add_library(tca-tool
+    SHARED
     tensorCompAnalysis.cpp)
 
 target_link_libraries(tca-tool
