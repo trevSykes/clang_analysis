@@ -111,7 +111,7 @@ public:
                     currentLoopDepth++;
 
                     // Record an initialization for this loop variable.
-                    llvm::errs() << "[DEBUG] Found loop variable: " << VD->getNameAsString() << "\n";
+                    // llvm::errs() << "[DEBUG] Found loop variable: " << VD->getNameAsString() << "\n";
                     InitRecord rec;
                     rec.varName = VD->getNameAsString();
                     rec.initType = "for_loop";
@@ -140,7 +140,7 @@ public:
                     currentLoopDepth++;
 
                     // Record an initialization for this loop variable.
-                    llvm::errs() << "[DEBUG] Found loop variable: " << DRE->getNameInfo().getAsString() << "\n";
+                    // llvm::errs() << "[DEBUG] Found loop variable: " << DRE->getNameInfo().getAsString() << "\n";
                     InitRecord rec;
                     rec.varName = DRE->getNameInfo().getAsString();
                     rec.initType = "for_loop";
@@ -157,7 +157,7 @@ public:
                     return true;
                 }
             }
-            llvm::errs() << "[DEBUG] For loop initializer is not a DeclStmt, it is: " 
+            // llvm::errs() << "[DEBUG] For loop initializer is not a DeclStmt, it is: " 
                          << FS->getInit()->getStmtClassName() << "\n";
         }
         // Fallback: if we cannot extract a loop variable, just traverse the children.
