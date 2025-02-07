@@ -9,6 +9,8 @@
 #include <map>
 #include <string>
 #include <vector>
+#include <set>
+#include <algorithm>
 #include <json/json.h> 
 
 using namespace clang;
@@ -32,17 +34,69 @@ struct AssignmentRecord {
     unsigned lineNumber;     // Source line number of the assignment.
 };
 
+// Structure to record for–loop information.
 struct LoopInfo {
-    std::string varName;
-    unsigned loopDepth;
+    std::string varName;     // Name of the loop variable.
+    unsigned loopDepth;      // The depth at which the loop was encountered.
 };
+
+bool loopIsAnInitialiser(ForStmt *FS) {
+    // Print for debugging.
+    // llvm::errs() << "[DEBUG] Checking if loop is an initialiser\n";
+    Stmt *Body = FS->getBody();
+    if (!Body)
+        return false;
+    if (auto *CS = dyn_cast<CompoundStmt>(Body)) {
+        for (auto *S : CS->body()) {
+            if (auto *BO = dyn_cast<BinaryOperator>(S)) {
+                if (BO->isAssignmentOp()) {
+                    Expr *RHS = BO->getRHS();
+                    if (auto *IL = dyn_cast<IntegerLiteral>(RHS)) {
+                        // llvm::errs() << "[DEBUG] Found an integer literal\n";
+                    } else if (auto *FL = dyn_cast<FloatingLiteral>(RHS)){
+                        // llvm::errs() << "[DEBUG] Found a floating literal\n";
+                    } else {
+                        return false;
+                    }
+                } else {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+        return true;
+    }
+    return false;
+}
 
 class TensorOutputVisitor : public RecursiveASTVisitor<TensorOutputVisitor> {
 public:
     explicit TensorOutputVisitor(ASTContext *Context)
       : Context(Context), currentLoopDepth(0) {}
 
+    // ------------------------------------------------------------------------
+    // 1. VisitUnaryOperator: record pointer update (e.g. for ++/--)
+    // Instead of using the global currentLoopDepth we record the entire active loop stack.
+    bool VisitUnaryOperator(UnaryOperator *UO) {
+        if (UO->isIncrementDecrementOp()) { // catches ++/--
+            if (DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(UO->getSubExpr()->IgnoreParenImpCasts())) {
+                std::string varName = DRE->getNameInfo().getAsString();
+                // Increase our candidate counter.
+                candidateAssignments[varName]++;
+                // Instead of recording only currentLoopDepth, record all active loops.
+                for (const auto &li : loopStack) {
+                    pointerUpdateActiveLoops[varName].insert({li.loopDepth, li.varName});
+                }
+            }
+        }
+        return true;
+    }
+    
+    // ------------------------------------------------------------------------
+    // Process function declarations.
     bool VisitFunctionDecl(FunctionDecl *FD) {
+
         // Only process functions with a body.
         if (!FD->hasBody())
             return true;
@@ -50,23 +104,29 @@ public:
         // Reset state at the beginning of each function.
         candidateAssignments.clear();
         loopStack.clear();
+        allLoops.clear();
         initRecords.clear();
         assignmentRecords.clear();
         currentLoopDepth = 0;
+        pointerUpdates.clear();
+        pointerResets.clear();
+        pointerUpdateActiveLoops.clear();
 
+        // Record parameters.
         for (unsigned i = 0; i < FD->getNumParams(); i++) {
             VisitParmVarDecl(FD->getParamDecl(i));
         }
-            TraverseStmt(FD->getBody());
+        // Traverse the body.
+        TraverseStmt(FD->getBody());
 
-        // Choose the candidate output variable via maximum assignments.
+        // Choose the candidate output variable via our heuristic.
         std::string candidateOutput = chooseOutputVariable();
 
         // Build JSON output.
         Json::Value result;
         result["candidate_output"] = candidateOutput;
 
-        // Build initialization map JSON.
+        // --- Output the recorded initializations.
         Json::Value initMapJson(Json::arrayValue);
         for (const auto &initRec : initRecords) {
             Json::Value recJson;
@@ -79,7 +139,7 @@ public:
         }
         result["init_map"] = initMapJson;
 
-        // Build assignment map JSON.
+        // --- Output the assignment records.
         Json::Value assignMapJson(Json::arrayValue);
         for (const auto &assignRec : assignmentRecords) {
             Json::Value recJson;
@@ -93,35 +153,125 @@ public:
         }
         result["assignment_map"] = assignMapJson;
 
+        // --- Now, infer and report the output tensor's dimensionality.
+        // Determine if the candidate is used as a pointer or as an array.
+        bool isArrayCandidate = false;
+        for (const auto &rec : assignmentRecords) {
+            // If any assignment record for the candidate contains an index expression,
+            // assume that the candidate is used as an array.
+            if (rec.varName == candidateOutput && !rec.indexExpr.empty()) {
+                isArrayCandidate = true;
+                break;
+            }
+        }
+        
+        Json::Value dims(Json::arrayValue);
+        if (!isArrayCandidate) {
+            // --- (A) Candidate is a pointer.
+            // Use the union of active loop contexts recorded at pointer update.
+            std::vector<std::pair<unsigned, std::string>> dimsVec;
+            if (pointerUpdateActiveLoops.find(candidateOutput) != pointerUpdateActiveLoops.end()) {
+                for (auto &entry : pointerUpdateActiveLoops[candidateOutput]) {
+                    dimsVec.push_back(entry);
+                }
+            }
+            // Sort by loop depth.
+            std::sort(dimsVec.begin(), dimsVec.end(), [](const auto &a, const auto &b) {
+                return a.first < b.first;
+            });
+            // Report each active loop as a tensor dimension.
+            for (auto &p : dimsVec) {
+                Json::Value dim;
+                dim["loopDepth"] = static_cast<int>(p.first);
+                dim["loopVar"] = p.second;
+                dims.append(dim);
+            }
+        } else {
+            // --- (B) Candidate is an array.
+            // Collapse the index expressions from assignment records.
+            std::string combinedIndexExpr;
+            for (const auto &rec : assignmentRecords) {
+                if (rec.varName == candidateOutput && !rec.indexExpr.empty()) {
+                    combinedIndexExpr += rec.indexExpr + " ";
+                }
+            }
+            // Helper lambda: substitute local variable names with their initializer text.
+            auto collapseIndexExpr = [&](const std::string &expr) -> std::string {
+                std::string collapsed = expr;
+                for (const auto &rec : initRecords) {
+                    if (rec.initType == "local" && !rec.initValue.empty()) {
+                        size_t pos = 0;
+                        while ((pos = collapsed.find(rec.varName, pos)) != std::string::npos) {
+                            collapsed.replace(pos, rec.varName.size(), rec.initValue);
+                            pos += rec.initValue.size();
+                        }
+                    }
+                }
+                return collapsed;
+            };
+            // Helper lambda: extract loop variable names from the collapsed expression.
+            auto extractLoopVars = [&](const std::string &expr) -> std::vector<std::string> {
+                std::vector<std::string> loopVars;
+                for (const auto &li : allLoops) {
+                    if (expr.find(li.varName) != std::string::npos)
+                        loopVars.push_back(li.varName);
+                }
+                return loopVars;
+            };
+
+            std::string collapsedExpr = collapseIndexExpr(combinedIndexExpr);
+            auto loopVars = extractLoopVars(collapsedExpr);
+            std::set<std::string> uniqueLoopVars(loopVars.begin(), loopVars.end());
+            for (const auto &lv : uniqueLoopVars) {
+                Json::Value dim;
+                dim["loopVar"] = lv;
+                for (const auto &li : allLoops) {
+                    if (li.varName == lv) {
+                        dim["loopDepth"] = static_cast<int>(li.loopDepth);
+                        break;
+                    }
+                }
+                dims.append(dim);
+            }
+        }
+        result["tensor_dimensions"] = dims;
+
         llvm::outs() << result.toStyledString() << "\n";
         return true;
     }
 
-    // Traverse for-loop statements to record loop variable initializations.
+
+    // ------------------------------------------------------------------------
+    // Traverse for-loop statements.
+    // Record every loop in the vector 'allLoops' (as well as push/pop the temporary loopStack).
     bool TraverseForStmt(ForStmt *FS) {
-        // Try to extract the loop variable from the for-loop initializer.
+        if (loopIsAnInitialiser(FS)) {
+            //Declare which loop we are skipping
+            // llvm::errs() << "[DEBUG] Skipping loop";
+            // FS->getInit()->dump();
+            return RecursiveASTVisitor<TensorOutputVisitor>::TraverseForStmt(FS);
+        }
+        // llvm::errs() << "[DEBUG] YOOOHOOO\n";
+        // llvm::errs() << "[DEBUG] Visiting loop with index" << currentLoopDepth << "\n";
         if (DeclStmt *DS = dyn_cast<DeclStmt>(FS->getInit())) {
             for (auto it = DS->decl_begin(); it != DS->decl_end(); ++it) {
                 if (VarDecl *VD = dyn_cast<VarDecl>(*it)) {
-                    // Record loop variable information.
                     LoopInfo li;
                     li.varName = VD->getNameAsString();
                     li.loopDepth = currentLoopDepth;
                     loopStack.push_back(li);
+                    allLoops.push_back(li);
                     currentLoopDepth++;
-
+                    
                     // Record an initialization for this loop variable.
-                    // llvm::errs() << "[DEBUG] Found loop variable: " << VD->getNameAsString() << "\n";
                     InitRecord rec;
-                    rec.varName = VD->getNameAsString();
+                    rec.varName = li.varName;
                     rec.initType = "for_loop";
-                    rec.loopDepth = currentLoopDepth - 1;
+                    rec.loopDepth = li.loopDepth;
                     rec.initValue = "";
-                    // Get the line number.
                     rec.lineNumber = Context->getSourceManager().getSpellingLineNumber(VD->getBeginLoc());
                     initRecords.push_back(rec);
 
-                    // Traverse the loop body.
                     TraverseStmt(FS->getBody());
                     currentLoopDepth--;
                     loopStack.pop_back();
@@ -129,54 +279,44 @@ public:
                 }
             }
         } else if (BinaryOperator *BO = dyn_cast<BinaryOperator>(FS->getInit())) {
-            // Handle the case where the loop variable is initialized in the condition.
             if (BO->isAssignmentOp()) {
                 if (DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(BO->getLHS()->IgnoreParenImpCasts())) {
-                    // Record loop variable information.
                     LoopInfo li;
                     li.varName = DRE->getNameInfo().getAsString();
                     li.loopDepth = currentLoopDepth;
                     loopStack.push_back(li);
+                    allLoops.push_back(li);
                     currentLoopDepth++;
 
-                    // Record an initialization for this loop variable.
-                    // llvm::errs() << "[DEBUG] Found loop variable: " << DRE->getNameInfo().getAsString() << "\n";
                     InitRecord rec;
-                    rec.varName = DRE->getNameInfo().getAsString();
+                    rec.varName = li.varName;
                     rec.initType = "for_loop";
-                    rec.loopDepth = currentLoopDepth - 1;
+                    rec.loopDepth = li.loopDepth;
                     rec.initValue = "";
-                    // Get the line number.
                     rec.lineNumber = Context->getSourceManager().getSpellingLineNumber(DRE->getBeginLoc());
                     initRecords.push_back(rec);
 
-                    // Traverse the loop body.
                     TraverseStmt(FS->getBody());
                     currentLoopDepth--;
                     loopStack.pop_back();
                     return true;
                 }
             }
-            // llvm::errs() << "[DEBUG] For loop initializer is not a DeclStmt, it is: " 
-                         << FS->getInit()->getStmtClassName() << "\n";
         }
-        // Fallback: if we cannot extract a loop variable, just traverse the children.
         return RecursiveASTVisitor<TensorOutputVisitor>::TraverseForStmt(FS);
     }
 
+    // ------------------------------------------------------------------------
     // Record local variable declarations.
     bool VisitVarDecl(VarDecl *VD) {
-        // Only record declarations within function bodies.
         if (!VD->isLocalVarDecl())
             return true;
-
         InitRecord rec;
         rec.varName = VD->getNameAsString();
         rec.initType = "local";
         rec.loopDepth = currentLoopDepth;
         rec.initValue = "";
         if (VD->hasInit()) {
-            // Get the initializer text.
             auto &SM = Context->getSourceManager();
             SourceLocation Start = VD->getInit()->getBeginLoc();
             SourceLocation End = VD->getInit()->getEndLoc();
@@ -188,94 +328,115 @@ public:
         return true;
     }
 
+    // ------------------------------------------------------------------------
     // Record parameter declarations.
     bool VisitParmVarDecl(ParmVarDecl *PVD) {    
         std::string paramName = PVD->getNameAsString();
-
-        // Check if the parameter already exists in initRecords
         for (const auto &rec : initRecords) {
-             if (rec.varName == paramName) {
-            return true; // Avoid duplicate entries
-               }
-              }       
+            if (rec.varName == paramName)
+                return true; // Avoid duplicate entries.
+        }
         InitRecord rec;
-        rec.varName = PVD->getNameAsString();
+        rec.varName = paramName;
         rec.initType = "parameter";
-        rec.loopDepth = currentLoopDepth; // likely 0 for parameters
-        rec.initValue = "";  // parameters do not have an initializer in the function body.
+        rec.loopDepth = currentLoopDepth;
+        rec.initValue = "";
         rec.lineNumber = Context->getSourceManager().getSpellingLineNumber(PVD->getBeginLoc());
         initRecords.push_back(rec);
         return true;
     }
 
-    // Record assignment and compound assignment operations.
+    // ------------------------------------------------------------------------
+    // Record assignments and detect pointer resets.
     bool VisitBinaryOperator(BinaryOperator *BO) {
-        if (BO->isAssignmentOp() || BO->isCompoundAssignmentOp()) {
-            AssignmentRecord rec;
-            rec.loopDepth = currentLoopDepth;
-            rec.lineNumber = Context->getSourceManager().getSpellingLineNumber(BO->getOperatorLoc());
+    if (BO->isAssignmentOp() || BO->isCompoundAssignmentOp()) {
+        AssignmentRecord rec;
+        rec.loopDepth = currentLoopDepth;
+        rec.lineNumber = Context->getSourceManager().getSpellingLineNumber(BO->getOperatorLoc());
+        rec.arrayName = "";
+        rec.indexExpr = "";
 
-            // Default: no array indexing.
-            rec.arrayName = "";
-            rec.indexExpr = "";
-
-            // Check if the LHS is an array subscript.
-            if (ArraySubscriptExpr *ASE = dyn_cast<ArraySubscriptExpr>(BO->getLHS())) {
-                // For array assignments, record the array base variable.
-                if (DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(ASE->getBase()->IgnoreParenImpCasts())) {
+        // Check for array subscript on the LHS.
+        if (ArraySubscriptExpr *ASE = dyn_cast<ArraySubscriptExpr>(BO->getLHS())) {
+            if (DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(ASE->getBase()->IgnoreParenImpCasts())) {
+                rec.varName = DRE->getNameInfo().getAsString();
+                rec.arrayName = rec.varName;
+                auto &SM = Context->getSourceManager();
+                SourceLocation Start = ASE->getIdx()->getBeginLoc();
+                SourceLocation End = ASE->getIdx()->getEndLoc();
+                CharSourceRange range = CharSourceRange::getTokenRange(Start, End);
+                rec.indexExpr = Lexer::getSourceText(range, SM, LangOptions()).str();
+            }
+        }
+        // If LHS is a direct DeclRefExpr.
+        else if (DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(BO->getLHS()->IgnoreParenImpCasts())) {
+            rec.varName = DRE->getNameInfo().getAsString();
+        }
+        // NEW: If LHS is a UnaryOperator (e.g., a dereference "*p_c")
+        else if (UnaryOperator *UO = dyn_cast<UnaryOperator>(BO->getLHS()->IgnoreParenImpCasts())) {
+            if (UO->getOpcode() == UO_Deref) {
+                if (DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(UO->getSubExpr()->IgnoreParenImpCasts())) {
                     rec.varName = DRE->getNameInfo().getAsString();
-                    rec.arrayName = rec.varName;
-                    // Get the index expression as source text.
-                    auto &SM = Context->getSourceManager();
-                    SourceLocation Start = ASE->getIdx()->getBeginLoc();
-                    SourceLocation End = ASE->getIdx()->getEndLoc();
-                    CharSourceRange range = CharSourceRange::getTokenRange(Start, End);
-                    rec.indexExpr = Lexer::getSourceText(range, SM, LangOptions()).str();
                 }
             }
-            // Otherwise, if the LHS is a plain reference.
-            else if (DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(BO->getLHS()->IgnoreParenImpCasts())) {
-                rec.varName = DRE->getNameInfo().getAsString();
-            }
-
-            // Get the RHS expression as source text.
-            if (BO->getRHS()) {
-                auto &SM = Context->getSourceManager();
-                SourceLocation Start = BO->getRHS()->getBeginLoc();
-                SourceLocation End = BO->getRHS()->getEndLoc();
-                CharSourceRange range = CharSourceRange::getTokenRange(Start, End);
-                rec.valueExpr = Lexer::getSourceText(range, SM, LangOptions()).str();
-            } else {
-                rec.valueExpr = "";
-            }
-
-            // Increment our assignment counter for candidate selection.
-            if (!rec.varName.empty()) {
-                candidateAssignments[rec.varName]++;
-            }
-            assignmentRecords.push_back(rec);
         }
-        return true;
+
+        // Get RHS expression as source text.
+        if (BO->getRHS()) {
+            auto &SM = Context->getSourceManager();
+            SourceLocation Start = BO->getRHS()->getBeginLoc();
+            SourceLocation End = BO->getRHS()->getEndLoc();
+            CharSourceRange range = CharSourceRange::getTokenRange(Start, End);
+            rec.valueExpr = Lexer::getSourceText(range, SM, LangOptions()).str();
+            // If RHS is an address-of operator, count as a pointer reset.
+            if (UnaryOperator *UO = dyn_cast<UnaryOperator>(BO->getRHS()->IgnoreParenImpCasts())) {
+                if (UO->getOpcode() == UO_AddrOf)
+                    pointerResets[rec.varName]++;
+            }
+        } else {
+            rec.valueExpr = "";
+        }
+        if (!rec.varName.empty())
+            candidateAssignments[rec.varName]++;
+        assignmentRecords.push_back(rec);
     }
+    return true;
+}
+
 
 private:
     ASTContext *Context;
     unsigned currentLoopDepth;
-    std::vector<LoopInfo> loopStack;
-    // Vectors to hold our maps.
+    std::vector<LoopInfo> loopStack;  // active loop stack (for current context)
+    std::vector<LoopInfo> allLoops;   // all encountered loops
+
+    // Data for initializations and assignments.
     std::vector<InitRecord> initRecords;
     std::vector<AssignmentRecord> assignmentRecords;
+    
+    // For pointer analysis.
+    // (pointerUpdates is kept for legacy purposes, though we now use pointerUpdateActiveLoops)
+    std::map<std::string, std::vector<unsigned>> pointerUpdates;
+    std::map<std::string, unsigned> pointerResets; // count pointer resets
+    // New: record the full set of active loops at each pointer update.
+    std::map<std::string, std::set<std::pair<unsigned, std::string>>> pointerUpdateActiveLoops;
 
-    // Map to count assignments per variable (for candidate selection).
+    // For candidate selection.
     std::map<std::string, unsigned> candidateAssignments;
 
-    // Choose the candidate output variable based on the maximum number of assignments.
+    // Choose candidate output variable based on assignment counts (and ignore those that reset).
     std::string chooseOutputVariable() {
         std::string candidate;
-        unsigned maxAssign = 0;
+        unsigned maxScore = 0;
         for (auto &entry : candidateAssignments) {
-            if (entry.second > maxAssign) {
-                maxAssign = entry.second;
+            unsigned resets = pointerResets[entry.first];
+            if (resets > 0)
+                continue;
+            unsigned score = entry.second;
+            if (pointerUpdates.count(entry.first))
+                score += pointerUpdates[entry.first].size();
+            if (score > maxScore) {
+                maxScore = score;
                 candidate = entry.first;
             }
         }
