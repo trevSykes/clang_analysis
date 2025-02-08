@@ -359,7 +359,7 @@ public:
             rec.lineNumber = Context->getSourceManager().getSpellingLineNumber(BO->getOperatorLoc());
             rec.arrayName = "";
             rec.indexExpr = "";
-            llvm::errs() << "[DEBUG] Found an assignment\n";
+            // llvm::errs() << "[DEBUG] Found an assignment\n";
             
             // If the LHS is an array subscript (possibly nested)
             if (const auto *ASE = dyn_cast<ArraySubscriptExpr>(BO->getLHS()->IgnoreParenImpCasts())) {
