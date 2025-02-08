@@ -87,8 +87,17 @@ bool loopIsAnInitialiser(ForStmt *FS) {
             if (auto *BO = dyn_cast<BinaryOperator>(S)) {
                 if (BO->isAssignmentOp()) {
                     Expr *RHS = BO->getRHS();
-                    if (dyn_cast<IntegerLiteral>(RHS) || dyn_cast<FloatingLiteral>(RHS)) {
-                        // All assignments are to literals.
+                    // Check if the RHS is a 0 constant -- We might not need to check if it is zero
+                    if (auto *IL = dyn_cast<IntegerLiteral>(RHS)) {
+                        llvm::APInt intVal = IL->getValue();
+                        uint64_t val = intVal.getZExtValue();
+                        if (val != 0)
+                            return false;
+                    } else if (auto *FL = dyn_cast<FloatingLiteral>(RHS)) {
+                        llvm::APFloat floatVal = FL->getValue();
+                        double val = floatVal.convertToDouble();
+                        if (val != 0.0)
+                            return false;
                     } else {
                         return false;
                     }
@@ -225,7 +234,7 @@ public:
             auto extractLoopVars = [&](const std::string &expr) -> std::vector<std::string> {
                 std::vector<std::string> loopVars;
                 for (const auto &li : allLoops) {
-                    if (expr.find(li.varName) != std::string::npos)
+                    if  (expr.find(li.varName) != std::string::npos)
                         loopVars.push_back(li.varName);
                 }
                 return loopVars;
